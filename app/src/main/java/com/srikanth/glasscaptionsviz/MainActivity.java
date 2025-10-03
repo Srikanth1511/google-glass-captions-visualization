@@ -42,7 +42,7 @@ public class MainActivity extends Activity implements AudioEngine.WaveformListen
     // Emphasis logic (in dB domain)
     private static final float DB_SPIKE_RATIO = 1.15f; // 15% over rolling dB average triggers emphasis
     private static final float EMA_ALPHA = 0.20f;      // dB rolling average smoothing
-    private static final float DB_MIN = -60f;          // floor for silence in dBFS - change this to chek the background
+    private static final float DB_MIN = -10f;          // floor for silence in dBFS - change this to chek the background
     private static final float EPS = 1e-6f;
     // Silence → “Listening…” after 10s with no speech activity
     private static final long SILENCE_MS = 15_000L;
@@ -315,7 +315,7 @@ public class MainActivity extends Activity implements AudioEngine.WaveformListen
 
         @Override public void onEndOfSpeech() {
             log("end");
-            if (audioEngine != null) audioEngine.stopWaveformRecording();
+            //if (audioEngine != null) audioEngine.stopWaveformRecording();
             resetSilenceTimer();
         }
 
@@ -325,7 +325,7 @@ public class MainActivity extends Activity implements AudioEngine.WaveformListen
                 captions.setTextSize(TypedValue.COMPLEX_UNIT_SP, BASE_SP);
                 captions.setText("Speech error: " + error);
             }
-            if (audioEngine != null) audioEngine.stopWaveformRecording();
+            //if (audioEngine != null) audioEngine.stopWaveformRecording();
             // quick restart loop for continuous captions
             restartSttQuick();
             resetSilenceTimer();
@@ -337,7 +337,7 @@ public class MainActivity extends Activity implements AudioEngine.WaveformListen
             if (list != null && !list.isEmpty() && captions != null) {
                 setCaptionWithEmphasis(list.get(0));
             }
-            if (audioEngine != null) audioEngine.stopWaveformRecording();
+            //if (audioEngine != null) audioEngine.stopWaveformRecording();
             // brief pause to let user read, then restart
             new Thread(() -> {
                 try { Thread.sleep(1200); } catch (InterruptedException ignored) {}

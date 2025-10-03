@@ -1,311 +1,296 @@
 package com.srikanth.glasscaptionsviz.viz;
 
 import android.content.Context;
-import android.graphics.Bitmap;
-import android.graphics.Canvas;
-import android.graphics.Paint;
-import android.graphics.Rect;
-import android.graphics.RectF;
+import android.graphics.*;
 import android.util.AttributeSet;
-import android.util.Log;
 import android.view.View;
 
-public class SpectrogramView extends View implements AudioEngine.SpectrogramSink, AudioEngine.LoudnessListener {
-    private static final String TAG = "SpectrogramView";
+public class SpectrogramView extends View
+        implements AudioEngine.SpectrogramSink, AudioEngine.LoudnessListener {
+
     private Bitmap bmp;
-    private int cols = 256;   // time axis
-    private int rows = 128;   // frequency bins
+    private int cols = 640;
+    private int rows = 256;
     private int writeCol = 0;
 
-    // Loudness meter
+    // Loudness meter (normalized 0..1) + simple peak hold
     private float currentLoudness = 0f;
     private float peakLoudness = 0f;
-    private long peakTime = 0;
-    private Paint loudnessPaint;
-    private Paint peakPaint;
-    private Paint loudnessBgPaint;
-    private Paint textPaint;
+    private long peakTime = 0L;
+    private static final long PEAK_HOLD_TIME = 1000L;
 
-    // Waveform persistence
-    private float[] persistentWaveform;
-    private boolean showPersistentWaveform = false;
-    private Paint waveformPaint;
+    // Optional waveform overlay
+    private float[] lastWaveform = null;
 
-    // Constants
-    private static final int LOUDNESS_METER_WIDTH = 15; // Much smaller - auto-adjusts based on screen
-    private static final long PEAK_HOLD_TIME = 1000; // ms
+    private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
-    public SpectrogramView(Context c) {
-        super(c);
-        init();
-        Log.d(TAG, "SpectrogramView created with single parameter constructor");
-    }
+    // Column buffer to reduce per-pixel JNI calls
+    private int[] colBuf;
 
-    public SpectrogramView(Context c, AttributeSet a) {
-        super(c, a);
-        init();
-        Log.d(TAG, "SpectrogramView created with AttributeSet constructor");
-    }
+    // Cache for row→bin mapping (recomputed if FFT size or rows change)
+    private int[] rowToBin = null;
+    private int cachedBinCount = -1;
+
+    public SpectrogramView(Context c) { super(c); init(); }
+    public SpectrogramView(Context c, AttributeSet a) { super(c, a); init(); }
+    public SpectrogramView(Context c, AttributeSet a, int s) { super(c, a, s); init(); }
 
     private void init() {
-        Log.d(TAG, "Initializing SpectrogramView");
-        // Loudness meter paints
-        loudnessPaint = new Paint();
-        loudnessPaint.setAntiAlias(true);
+        setLayerType(LAYER_TYPE_HARDWARE, null);
+        ensureBitmap();
+    }
 
-        peakPaint = new Paint();
-        peakPaint.setColor(0xFFFF0000); // Red for peaks
-        peakPaint.setAntiAlias(true);
+    private void ensureBitmap() {
+        if (bmp == null || bmp.getWidth() != cols || bmp.getHeight() != rows) {
+            bmp = Bitmap.createBitmap(cols, rows, Bitmap.Config.ARGB_8888);
+            colBuf = new int[rows];
+            rowToBin = null;           // will recompute on first column when we know N
+            cachedBinCount = -1;
+            clearAll();
+            writeCol = 0;
+        } else if (colBuf == null || colBuf.length != rows) {
+            colBuf = new int[rows];
+        }
+    }
 
-        loudnessBgPaint = new Paint();
-        loudnessBgPaint.setColor(0xFF222222); // Dark gray background
-        loudnessBgPaint.setAntiAlias(true);
+    private void ensureRowMap(int binCount) {
+        if (rowToBin != null && cachedBinCount == binCount && rowToBin.length == rows) return;
+        rowToBin = new int[rows];
+        for (int r = 0; r < rows; r++) {
+            // log-ish mapping (more resolution at low freq)
+            rowToBin[r] = (int) Math.min(binCount - 1,
+                    Math.pow((double) r / (double) rows, 1.25) * binCount);
+        }
+        cachedBinCount = binCount;
+    }
 
-        textPaint = new Paint();
-        textPaint.setColor(0xFFFFFFFF);
-        textPaint.setTextSize(12f);
-        textPaint.setAntiAlias(true);
+    private void clearAll() {
+        if (bmp == null) return;
+        int[] black = new int[cols * rows];
+        for (int i = 0; i < black.length; i++) black[i] = 0xFF000000;
+        bmp.setPixels(black, 0, cols, 0, 0, cols, rows);
+        invalidate();
+    }
 
-        // Waveform paint
-        waveformPaint = new Paint();
-        waveformPaint.setColor(0xFF222222); // Semi-transparent white
-        waveformPaint.setStrokeWidth(2f);
-        waveformPaint.setAntiAlias(true);
+    /** Clear previous utterance waveform overlay. */
+    public void clearWaveform() { lastWaveform = null; invalidate(); }
+
+    /** Display final utterance waveform overlay. */
+    public void showWaveformForSentence(float[] waveform) {
+        lastWaveform = waveform;
+        invalidate();
     }
 
     @Override
-    protected void onSizeChanged(int w, int h, int oldw, int oldh) {
-        super.onSizeChanged(w, h, oldw, oldh);
-        Log.d(TAG, "Size changed: " + w + "x" + h);
-        // Auto-adjust loudness meter width based on screen size
-        int adjustedMeterWidth = Math.min(LOUDNESS_METER_WIDTH + w/100, w/20); // Scale with screen
+    public void onLoudnessUpdate(float loudnessLinear) {
+        final float eps = 1e-6f;
+        float db = 20f * (float) Math.log10(Math.max(loudnessLinear, eps)); // [-inf..0]
+        float norm = (db + 60f) / 60f;                                      // [-60..0] → [0..1]
+        currentLoudness = Math.max(0f, Math.min(1f, norm));
 
-        // Reserve space for loudness meter
-        int spectrogramWidth = w - adjustedMeterWidth - 10;
-        cols = Math.max(64, Math.min(spectrogramWidth, 1024));
-        rows = Math.max(64, Math.min(h, 512));
-        bmp = Bitmap.createBitmap(cols, rows, Bitmap.Config.ARGB_8888);
-
-        // Initialize bitmap with pure black
-        bmp.eraseColor(0xFF222222);
-        writeCol = 0;
-
-        // Initialize persistent waveform
-        persistentWaveform = new float[cols];
-        Log.d(TAG, "Initialized with cols=" + cols + ", rows=" + rows + ", meterWidth=" + adjustedMeterWidth);
+        long now = System.currentTimeMillis();
+        if (currentLoudness > peakLoudness) {
+            peakLoudness = currentLoudness;
+            peakTime = now;
+        } else if (now - peakTime > PEAK_HOLD_TIME) {
+            peakLoudness *= 0.95f;
+        }
+        postInvalidateOnAnimation();
     }
 
     @Override
     public void onSpectrogramColumn(float[] mags) {
+        ensureBitmap();
         if (bmp == null || mags == null || mags.length == 0) return;
 
-        // Clear column: TRUE BLACK (not dark gray)
+        // Rebuild row→bin map if FFT size changed or on first draw
+        ensureRowMap(mags.length);
+
+        // Column-level silence/noise gate (~ -20 dB-ish)
+        double sum = 0.0;
+        for (float v : mags) sum += v;
+        float avgEnergy = (float)(sum / Math.max(1, mags.length));
+
+        // Pre-clear column buffer to black (ARGB)
+        for (int i = 0; i < rows; i++) colBuf[i] = 0xFF000000;
+
+        // If the entire column is basically silent, commit black and return
+        if (avgEnergy <= 0.0002f) { // Stricter column-level gate
+            bmp.setPixels(colBuf, 0, 1, writeCol, 0, 1, rows);
+            writeCol = (writeCol + 1) % cols;
+            postInvalidateOnAnimation();
+            return;
+        }
+
+        final int denom = Math.max(1, rows - 1);  // guard rows==1
+
         for (int r = 0; r < rows; r++) {
-            bmp.setPixel(writeCol, r, 0xFF000000);
+            int i0 = rowToBin[r];
+            float v = mags[i0];
+
+            // --- Per-bin dB floor: skip anything below ~ -25 dBFS ---
+            final float eps = 1e-9f;
+            float dbBin = 20f * (float)Math.log10(Math.max(v, eps));
+            if (dbBin < -25f) continue;  // Hard dB floor
+
+            // Perceptual amplitude mapping with compression
+            float level = (float)Math.log1p(v * 150f);
+            float norm = Math.min(level * 0.55f, 1f);
+            if (norm < 0f) norm = 0f;
+
+            // Apply gamma for perceptual brightness
+            norm = (float)Math.pow(norm, 0.48);
+
+            // Pixel gate (stricter): avoid drawing tiny residuals
+            if (norm <= 0.20f) continue;  // Raised threshold to eliminate faint pixels
+
+            // Normalized position (0 = low freq bottom, 1 = high top)
+            float pos = (float)r / (float)denom;
+
+            int color = carfacPalette(norm, pos);
+            // draw at image bottom for low frequencies
+            colBuf[rows - 1 - r] = color;
         }
 
-        // Parameters for dB scaling
-        final float eps = 1e-12f;
-        final float minDb = -60f, maxDb = -5f;
-        final float gateDb = -22f;  // below this, draw black
+        // Commit whole column in a single call
+        bmp.setPixels(colBuf, 0, 1, writeCol, 0, 1, rows);
 
-        int N = mags.length;
-        for (int bi = 0; bi < rows && bi < N; bi++) {
-            float mag = mags[bi];
-            float dB = 20f * (float)Math.log10(Math.max(mag, eps));
-            if (dB < gateDb) continue; // keep black
-
-            float t = (dB - minDb) / (maxDb - minDb); // 0..1
-            t = Math.max(0f, Math.min(1f, t));
-            // Small floor to avoid purple haze at near-silence
-            if (t < 0.06f) continue;
-
-            int color = vibrantPalette(t);
-            bmp.setPixel(writeCol, rows - 1 - bi, color);
-        }
-
+        // Advance write pointer
         writeCol = (writeCol + 1) % cols;
-        postInvalidate();
+        postInvalidateOnAnimation();
     }
-    @Override
-    public void onLoudnessUpdate(float loudnessLinear) {
-        // Convert linear RMS [0..1] to dBFS
-        final float eps = 1e-6f;
-        float db = 20f * (float)Math.log10(Math.max(loudnessLinear, eps)); // [-inf..0]
-        // Map [-60..0] dB -> [0..1]
-        float norm = (db + 60f) / 60f;
-        currentLoudness = Math.max(0f, Math.min(1f, norm));
 
-        // Peak hold logic unchanged
-        if (currentLoudness > peakLoudness) {
-            peakLoudness = currentLoudness;
-            peakTime = System.currentTimeMillis();
-        } else if (System.currentTimeMillis() - peakTime > PEAK_HOLD_TIME) {
-            peakLoudness *= 0.95f;
+    /**
+     * CAR-FAC accurate palette - NO baseline brightness, true black for quiet bins.
+     * Matches Google's pitchogram hue progression.
+     */
+    private int carfacPalette(float t, float pos) {
+        // Values below 0.20 are already filtered out in onSpectrogramColumn
+        // but double-check for safety
+        if (t < 0.20f) return 0xFF000000;
+
+        // Map [0.20, 1.0] → [0.0, 1.0] for color intensity
+        float intensity = (t - 0.20f) / 0.80f;
+
+        float h, s, v;
+
+        // CAR-FAC frequency-to-hue mapping
+        if (pos < 0.15f) {
+            // Very low frequencies: deep magenta/purple
+            float u = pos / 0.15f;
+            h = 290f - u * 20f;          // 290° → 270° (magenta-purple)
+            s = 0.80f + u * 0.10f;       // 0.80 → 0.90
+        } else if (pos < 0.30f) {
+            // Low frequencies: purple → blue
+            float u = (pos - 0.15f) / 0.15f;
+            h = 270f - u * 40f;          // 270° → 230° (purple-blue)
+            s = 0.90f;
+        } else if (pos < 0.45f) {
+            // Low-mid: blue → cyan
+            float u = (pos - 0.30f) / 0.15f;
+            h = 230f - u * 50f;          // 230° → 180° (blue-cyan)
+            s = 0.88f;
+        } else if (pos < 0.60f) {
+            // Mid: cyan → green
+            float u = (pos - 0.45f) / 0.15f;
+            h = 180f - u * 60f;          // 180° → 120° (cyan-green)
+            s = 0.85f;
+        } else if (pos < 0.75f) {
+            // Mid-high: green → yellow/gold
+            float u = (pos - 0.60f) / 0.15f;
+            h = 120f - u * 60f;          // 120° → 60° (green-yellow)
+            s = 0.88f;
+        } else {
+            // High frequencies: yellow → orange-red
+            float u = (pos - 0.75f) / 0.25f;
+            h = 60f - u * 45f;           // 60° → 15° (yellow-orange-red)
+            s = 0.90f + u * 0.05f;       // 0.90 → 0.95
         }
-        postInvalidate();
+
+        // NO baseline - intensity controls everything
+        // v goes from 0 (black) to 1.0 (full brightness)
+        v = intensity;
+
+        return hsvToRgb(h, s, v);
     }
 
-    public void showWaveformForSentence(float[] waveformData) {
-        Log.d(TAG, "Showing waveform for sentence");
-        if (persistentWaveform != null && waveformData != null) {
-            int len = Math.min(persistentWaveform.length, waveformData.length);
-            System.arraycopy(waveformData, 0, persistentWaveform, 0, len);
-            showPersistentWaveform = true;
-            postInvalidate();
-        }
-    }
+    /** HSV→RGB with strict clamping (safer than relying on float rounding). */
+    private int hsvToRgb(float h, float s, float v) {
+        h = h % 360f; if (h < 0f) h += 360f;
 
-    public void clearWaveform() {
-        Log.d(TAG, "Clearing waveform");
-        showPersistentWaveform = false;
-        postInvalidate();
-    }
+        float c = v * s;
+        float x = c * (1f - Math.abs((h / 60f) % 2f - 1f));
+        float m = v - c;
 
-    // Enhanced color palette for vibrant visualization like your image
-    private int vibrantPalette(float t) {
         float r, g, b;
+        if (h < 60f)       { r = c; g = x; b = 0f; }
+        else if (h < 120f) { r = x; g = c; b = 0f; }
+        else if (h < 180f) { r = 0f; g = c; b = x; }
+        else if (h < 240f) { r = 0f; g = x; b = c; }
+        else if (h < 300f) { r = x; g = 0f; b = c; }
+        else               { r = c; g = 0f; b = x; }
 
-        if (t < 0.2f) { // Deep blue/purple
-            float u = t / 0.2f;
-            r = 0.2f * u;
-            g = 0f;
-            b = 0.8f + 0.2f * u;
-        } else if (t < 0.4f) { // Blue to cyan
-            float u = (t - 0.2f) / 0.2f;
-            r = 0.2f + 0.3f * u;
-            g = 0.6f * u;
-            b = 1f;
-        } else if (t < 0.6f) { // Cyan to green
-            float u = (t - 0.4f) / 0.2f;
-            r = 0.5f - 0.5f * u;
-            g = 0.6f + 0.4f * u;
-            b = 1f - 0.5f * u;
-        } else if (t < 0.8f) { // Green to yellow
-            float u = (t - 0.6f) / 0.2f;
-            r = 0f + u;
-            g = 1f;
-            b = 0.5f - 0.5f * u;
-        } else { // Yellow to white/red
-            float u = (t - 0.8f) / 0.2f;
-            r = 1f;
-            g = 1f - 0.3f * u;
-            b = u * 0.8f;
-        }
+        float rf = r + m, gf = g + m, bf = b + m;
+        int R = (int)(Math.max(0f, Math.min(1f, rf)) * 255f);
+        int G = (int)(Math.max(0f, Math.min(1f, gf)) * 255f);
+        int B = (int)(Math.max(0f, Math.min(1f, bf)) * 255f);
 
-        int R = (int)(r * 255f);
-        int G = (int)(g * 255f);
-        int B = (int)(b * 255f);
         return 0xFF000000 | (R << 16) | (G << 8) | B;
     }
 
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
-
-        // IMPORTANT: Fill background with black first
-        canvas.drawColor(0xFF000000);
-
-        if (bmp == null) return;
-
-        // Auto-adjust meter width based on screen size
-        int adjustedMeterWidth = Math.min(LOUDNESS_METER_WIDTH + getWidth()/100, getWidth()/20);
-
-        // Draw spectrogram (leave space for loudness meter)
-        int spectrogramWidth = getWidth() - adjustedMeterWidth - 10;
-
-        // Make sure bitmap itself starts with black pixels
-        Rect srcRect = new Rect(0, 0, cols, rows);
-        Rect dstRect = new Rect(0, 0, spectrogramWidth, getHeight());
-        canvas.drawBitmap(bmp, srcRect, dstRect, null);
-
-        // Draw persistent waveform if active
-        if (showPersistentWaveform && persistentWaveform != null) {
-            drawWaveform(canvas, spectrogramWidth);
-        }
-
-        // Draw loudness meter with adjusted width
-        drawLoudnessMeter(canvas, spectrogramWidth + 5, adjustedMeterWidth);
-    }
-
-    private void drawWaveform(Canvas canvas, int spectrogramWidth) {
-        int centerY = getHeight() / 2;
-        int maxAmplitude = getHeight() / 4;
-
-        for (int i = 1; i < persistentWaveform.length && i < spectrogramWidth; i++) {
-            float x1 = (float)(i - 1) * spectrogramWidth / persistentWaveform.length;
-            float y1 = centerY + persistentWaveform[i - 1] * maxAmplitude;
-            float x2 = (float)i * spectrogramWidth / persistentWaveform.length;
-            float y2 = centerY + persistentWaveform[i] * maxAmplitude;
-
-            canvas.drawLine(x1, y1, x2, y2, waveformPaint);
-        }
-    }
-
-    private void drawLoudnessMeter(Canvas canvas, int x, int meterWidth) {
-        int meterHeight = getHeight() - 40; // Leave margin top/bottom
-        int meterY = 20;
+        ensureBitmap();
 
         // Background
-        RectF bgRect = new RectF(x, meterY, x + meterWidth, meterY + meterHeight);
-        canvas.drawRoundRect(bgRect, 4, 4, loudnessBgPaint);
+        canvas.drawColor(0xFF000000);
 
-        // Current level (gradient from green to red)
-        if (currentLoudness > 0) {
-            float levelHeight = currentLoudness * meterHeight;
+        // Spectrogram image (fit to view)
+        Rect src = new Rect(0, 0, bmp.getWidth(), bmp.getHeight());
+        Rect dst = new Rect(0, 0, getWidth(), getHeight());
+        canvas.drawBitmap(bmp, src, dst, paint);
 
-            // Color based on level
-            if (currentLoudness < 0.5f) {
-                // Green to yellow
-                float ratio = currentLoudness * 2f;
-                loudnessPaint.setColor(interpolateColor(0xFF00FF00, 0xFFFFFF00, ratio));
-            } else {
-                // Yellow to red
-                float ratio = (currentLoudness - 0.5f) * 2f;
-                loudnessPaint.setColor(interpolateColor(0xFFFFFF00, 0xFFFF0000, ratio));
+        // Loudness meter (right)
+        int w = getWidth(), h = getHeight();
+        int meterW = Math.max(6, w / 64);
+        int meterX = w - meterW - 6;
+        int meterY = 6;
+        int meterH = h - 12;
+
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setColor(0x55FFFFFF);
+        paint.setStrokeWidth(2f);
+        canvas.drawRect(meterX, meterY, meterX + meterW, meterY + meterH, paint);
+
+        int lvlH = (int) (currentLoudness * meterH);
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0x99FFFFFF);
+        canvas.drawRect(meterX + 2, meterY + (meterH - lvlH),
+                meterX + meterW - 2, meterY + meterH - 2, paint);
+
+        int peakH = (int) (peakLoudness * meterH);
+        paint.setColor(0xFFFFD54F);
+        canvas.drawRect(meterX + 2, meterY + (meterH - peakH) - 2,
+                meterX + meterW - 2, meterY + (meterH - peakH) + 2, paint);
+
+        // Waveform overlay
+        if (lastWaveform != null && lastWaveform.length > 1) {
+            paint.setColor(0x66FFFFFF);
+            paint.setStrokeWidth(2f);
+            float mid = h * 0.75f;
+            float amp = h * 0.10f;
+            int N = lastWaveform.length;
+            float dx = (float) w / (N - 1);
+            float x = 0f;
+            for (int i = 1; i < N; i++) {
+                float y0 = mid - amp * lastWaveform[i - 1];
+                float y1 = mid - amp * lastWaveform[i];
+                canvas.drawLine(x, y0, x + dx, y1, paint);
+                x += dx;
             }
-
-            RectF levelRect = new RectF(x + 1, meterY + meterHeight - levelHeight,
-                    x + meterWidth - 1, meterY + meterHeight - 1);
-            canvas.drawRoundRect(levelRect, 2, 2, loudnessPaint);
-        }
-
-        // Peak indicator
-        if (peakLoudness > 0) {
-            float peakY = meterY + meterHeight - (peakLoudness * meterHeight);
-            canvas.drawRect(x + 1, peakY - 1, x + meterWidth - 1, peakY + 1, peakPaint);
-        }
-
-        // Only draw scale markers if meter is wide enough
-        if (meterWidth > 20) {
-            textPaint.setTextSize(8f); // Smaller text
-            for (int i = 0; i <= 4; i++) {
-                float y = meterY + (i * meterHeight / 4f);
-                String label = String.valueOf(100 - (i * 25));
-                canvas.drawText(label, x + meterWidth + 2, y + 4, textPaint);
-            }
         }
     }
 
-    private int interpolateColor(int color1, int color2, float ratio) {
-        ratio = Math.max(0f, Math.min(1f, ratio));
-
-        int r1 = (color1 >> 16) & 0xFF;
-        int g1 = (color1 >> 8) & 0xFF;
-        int b1 = color1 & 0xFF;
-
-        int r2 = (color2 >> 16) & 0xFF;
-        int g2 = (color2 >> 8) & 0xFF;
-        int b2 = color2 & 0xFF;
-
-        int r = (int)(r1 + (r2 - r1) * ratio);
-        int g = (int)(g1 + (g2 - g1) * ratio);
-        int b = (int)(b1 + (b2 - b1) * ratio);
-
-        return 0xFF000000 | (r << 16) | (g << 8) | b;
-    }
-
-    public float getCurrentLoudness() {
-        return currentLoudness;
-    }
+    public float getCurrentLoudness() { return currentLoudness; }
 }
