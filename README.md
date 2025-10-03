@@ -51,4 +51,4 @@ adb -s <GLASS_IP>:5555 logcat GCViz:D AndroidRuntime:E ActivityManager:I *:S
 
 ## Credits
 
-Colour mapping inspired by Google’s CAR-FAC pitchogram demo. This project does **not** port the cochlear model; it adapts the visual style for an Android Java spectrogram.
+Colour mapping inspired by Google’s CAR-FAC pitchogram demo. 
